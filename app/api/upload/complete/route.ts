@@ -51,6 +51,12 @@ export async function POST(request: Request) {
     if (!doc) {
       return NextResponse.json({ error: "Document not found" }, { status: 404 });
     }
+    if (doc.status !== "uploading") {
+      return NextResponse.json(
+        { error: "Upload is not in a finalizable state" },
+        { status: 409 },
+      );
+    }
 
     await ensureUploadDirs();
     const tempPath = getTempFilePath(payload);
@@ -118,6 +124,18 @@ export async function POST(request: Request) {
     const message = error instanceof Error ? error.message : String(error);
     // Mark doc as failed if we know which one this was for better visibility.
     if (typeof docIdForFailure === "number") {
+      // Best-effort cleanup of any final file path left behind.
+      try {
+        const doc = await db.query.documents.findFirst({
+          where: eq(documents.id, docIdForFailure),
+        });
+        if (doc?.filePath) {
+          await fs.rm(doc.filePath, { force: true });
+        }
+      } catch {
+        // ignore cleanup errors
+      }
+
       await db
         .update(documents)
         .set({

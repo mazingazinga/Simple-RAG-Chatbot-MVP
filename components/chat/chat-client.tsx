@@ -80,7 +80,7 @@ export default function ChatClient({ sessionId }: Props) {
   }, [messages]);
 
   const refreshSession = useCallback(async () => {
-    setLoading(true);
+    setLoading((prev) => prev && !sessionState);
     const res = await fetch(`/api/session/${sessionId}`);
     if (!res.ok) {
       setLoading(false);
@@ -89,7 +89,7 @@ export default function ChatClient({ sessionId }: Props) {
     const data = (await res.json()) as SessionState;
     setSessionState(data);
     setLoading(false);
-  }, [sessionId]);
+  }, [sessionId, sessionState]);
 
   useEffect(() => {
     void refreshSession();
@@ -197,6 +197,13 @@ export default function ChatClient({ sessionId }: Props) {
             if (parsed.type === "citations") {
               pendingCitations = parsed.citations ?? [];
               continue;
+            }
+            if (parsed.type === "error") {
+              failedMessage =
+                typeof parsed.error === "string"
+                  ? parsed.error
+                  : failedMessage;
+              throw new Error(failedMessage);
             }
           } catch {
             // not JSON; treat as token text

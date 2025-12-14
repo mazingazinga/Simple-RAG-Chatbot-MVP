@@ -1,4 +1,6 @@
 import { and, eq, inArray, lt } from "drizzle-orm";
+import fs from "fs/promises";
+import path from "path";
 
 import { db } from "./index";
 import { chunks, documents, sessions } from "./schema";
@@ -111,6 +113,16 @@ export async function cleanupOldDoc(sessionId: number, olderThan: Date) {
     .where(
       and(eq(sessions.id, sessionId), inArray(sessions.activeDocumentId, docIds)),
     );
+
+  // Best-effort file cleanup for deleted documents.
+  const uploadDir = path.join(process.cwd(), "tmp", "uploads");
+  const filesDir = path.join(process.cwd(), "tmp", "files");
+  await Promise.all(
+    docIds.flatMap((id) => [
+      fs.rm(path.join(uploadDir, `${id}-*.part`), { force: true }).catch(() => undefined),
+      fs.rm(path.join(filesDir, `doc-${id}-*`), { force: true }).catch(() => undefined),
+    ]),
+  );
 
   return {
     deletedDocs: deletedDocs.length,

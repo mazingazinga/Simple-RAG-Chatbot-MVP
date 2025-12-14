@@ -112,7 +112,8 @@ export async function POST(request: Request) {
     const body = await request.json();
     const sessionId = Number(body.sessionId);
     const question = String(body.question ?? "").trim();
-    const topK = Math.min(Number(body.topK ?? TOP_K_DEFAULT) || TOP_K_DEFAULT, 10);
+    const rawTopK = Number(body.topK ?? TOP_K_DEFAULT) || TOP_K_DEFAULT;
+    const topK = Math.min(Math.max(rawTopK, 1), 10);
 
     if (!sessionId || !Number.isFinite(sessionId)) {
       return NextResponse.json({ error: "Invalid sessionId" }, { status: 400 });
@@ -122,15 +123,22 @@ export async function POST(request: Request) {
     }
 
     const openaiApiKey = process.env.OPENAI_API_KEY;
-    if (!openaiApiKey) {
-      return NextResponse.json(
-        { error: "OPENAI_API_KEY not set. Add it to .env.local to enable chat." },
-        { status: 400 },
-      );
-    }
-    const client = new OpenAI({ apiKey: openaiApiKey });
+    const hasApiKey = Boolean(openaiApiKey);
+    const client = hasApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
-    const doc = await fetchActiveDocument(sessionId);
+    let doc;
+    try {
+      doc = await fetchActiveDocument(sessionId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Active document unavailable";
+      const status = message.includes("not ready")
+        ? 409
+        : message.includes("not found")
+          ? 404
+          : 400;
+      return NextResponse.json({ error: message }, { status });
+    }
+
     const questionVector = await embedText(question);
     const citations = await searchChunks(doc.id, questionVector, topK);
     if (citations.length === 0) {
@@ -145,45 +153,77 @@ export async function POST(request: Request) {
 
     const stream = new ReadableStream({
       async start(controller) {
-        sendSse(controller, { type: "start" });
-        const prompt = buildPrompt(question, citations);
-
-        const response = await client.responses.create({
-          model: "gpt-4.1-mini",
-          stream: true,
-          input: prompt,
-        });
-
-        for await (const event of response) {
-          if (
-            event.type === "response.output_text.delta" &&
-            typeof event.delta === "string"
-          ) {
-            fullText += event.delta;
-            controller.enqueue(encoder.encode(`data: ${event.delta}\n\n`));
+        const abortSignal = (request as { signal?: AbortSignal }).signal;
+        const onAbort = () => {
+          try {
+            controller.close();
+          } catch {
+            // ignore
           }
+        };
+        abortSignal?.addEventListener("abort", onAbort);
+
+        try {
+          sendSse(controller, { type: "start" });
+
+          if (!hasApiKey || !client) {
+            // Offline fallback: return concatenated top snippets.
+            fullText = citations
+              .map((c, idx) => `[${idx + 1}] ${c.content}`)
+              .join("\n\n");
+            controller.enqueue(encoder.encode(`data: ${fullText}\n\n`));
+          } else {
+            const prompt = buildPrompt(question, citations);
+            const response = await client.responses.create({
+              model: "gpt-4.1-mini",
+              stream: true,
+              input: prompt,
+            });
+
+            for await (const event of response) {
+              if (abortSignal?.aborted) break;
+              if (
+                event.type === "response.output_text.delta" &&
+                typeof event.delta === "string"
+              ) {
+                fullText += event.delta;
+                controller.enqueue(encoder.encode(`data: ${event.delta}\n\n`));
+              }
+            }
+          }
+
+          if (abortSignal?.aborted) {
+            controller.close();
+            return;
+          }
+
+          sendSse(controller, { type: "citations", citations });
+
+          await db.transaction(async (tx) => {
+            await tx.insert(messages).values({
+              sessionId,
+              role: "user",
+              content: question,
+              metadata: { docId: doc.id },
+            });
+
+            await tx.insert(messages).values({
+              sessionId,
+              role: "assistant",
+              content: fullText,
+              metadata: { docId: doc.id, citations },
+            });
+          });
+
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Stream failed";
+          sendSse(controller, { type: "error", error: message });
+          controller.close();
+        } finally {
+          abortSignal?.removeEventListener("abort", onAbort);
         }
-
-        sendSse(controller, { type: "citations", citations });
-
-        await db.transaction(async (tx) => {
-          await tx.insert(messages).values({
-            sessionId,
-            role: "user",
-            content: question,
-            metadata: { docId: doc.id },
-          });
-
-          await tx.insert(messages).values({
-            sessionId,
-            role: "assistant",
-            content: fullText,
-            metadata: { docId: doc.id, citations },
-          });
-        });
-
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
       },
     });
 

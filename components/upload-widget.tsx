@@ -59,10 +59,10 @@ export function UploadWidget({
       });
 
       if (!initRes.ok) {
-            const errJson = await initRes.json().catch(() => ({} as { error?: string }));
-            const message = errJson?.error ?? "Failed to start upload";
-            throw new Error(message);
-          }
+        const errJson = await initRes.json().catch(() => ({} as { error?: string }));
+        const message = errJson?.error ?? "Failed to start upload";
+        throw new Error(message);
+      }
 
       const initData = await initRes.json();
       const token = initData.token as string;
@@ -116,7 +116,15 @@ export function UploadWidget({
       );
 
       if (!completeRes.ok) {
-        throw new Error("Failed to finalize upload");
+        const errText = await completeRes.text().catch(() => "");
+        let message = "Failed to finalize upload";
+        try {
+          const json = JSON.parse(errText);
+          message = json.error ?? message;
+        } catch {
+          if (errText) message = errText;
+        }
+        throw new Error(message);
       }
 
       setState({
@@ -131,6 +139,10 @@ export function UploadWidget({
         progress: 0,
         message: error instanceof Error ? error.message : "Upload failed",
       });
+      // Allow re-selecting the same file after an error.
+      if (inputRef.current) {
+        inputRef.current.value = "";
+      }
     }
   }
 

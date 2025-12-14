@@ -12,6 +12,8 @@ import {
 
 export const runtime = "nodejs";
 
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50MB
+
 function extractToken(request: Request) {
   const url = new URL(request.url);
   const queryToken = url.searchParams.get("token");
@@ -48,11 +50,30 @@ export async function POST(request: Request) {
     if (!doc) {
       return NextResponse.json({ error: "Document not found" }, { status: 404 });
     }
+    if (doc.status === "processing" || doc.status === "ready") {
+      return NextResponse.json(
+        { error: "Upload already completed or processing" },
+        { status: 409 },
+      );
+    }
 
     await ensureUploadDirs();
     const tempPath = getTempFilePath(payload);
     await fs.appendFile(tempPath, buffer);
     const stats = await fs.stat(tempPath);
+
+    if (Number(stats.size) > MAX_UPLOAD_BYTES) {
+      await fs.rm(tempPath, { force: true });
+      await db
+        .update(documents)
+        .set({
+          status: "failed",
+          metadata: { ...(doc.metadata ?? {}), error: "max upload size exceeded" },
+          updatedAt: new Date(),
+        })
+        .where(eq(documents.id, payload.docId));
+      return NextResponse.json({ error: "max upload size exceeded" }, { status: 413 });
+    }
 
     await db
       .update(documents)
